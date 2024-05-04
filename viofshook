@@ -1,0 +1,110 @@
+#!/bin/bash
+
+SOCKETPATH=/run
+VMID=$1
+PHASE=$2
+CONFIGFILE=$0.conf
+VMCONFIG=/etc/pve/qemu-server/${VMID}.conf
+#DEBUG=echo
+
+# Read viofshook.conf
+ReadConfig()
+{
+	[ -r ${CONFIGFILE} ] || { echo "Cannot read config file"; exit 2; }
+	CONFIG=$(grep "^${VMID}:" ${CONFIGFILE})
+	if [ ! -z "${CONFIG}" ]
+	then    
+		readarray -td',' SHARES <<< $(cut -d ':' -f 2 <<< ${CONFIG})
+	fi
+}
+
+Prepare()
+{
+# Test for virtiofsd
+	[ -x /usr/libexec/virtiofsd ] || { echo "Cannot find or execute /usr/libexec/virtiofsd. Try \"apt install virtiofsd\""; exit 2; }
+
+# Check if VM exists
+	[ -r ${VMCONFIG} ] || { echo "Invalid VMID provided. This should not happen"; exit 2; }
+
+	ReadConfig
+
+# No share configured. Provide a hint, but ignore
+	[ -z ${SHARES} ] && { echo "No shares configured for VM"; exit 0; }
+}
+
+PreStart()
+{
+	Prepare
+
+	COUNT=0
+	for SHARE in "${SHARES[@]}"
+	do
+		IFS="=" read TAG VIOPATH <<< ${SHARE}
+
+# Fail if configured directory is unavailable
+		[ -d "${VIOPATH}" ] || { echo "Path '${VIOPATH}' not found"; return 2; }
+
+# Execute virtiofsd via systemd-run
+		SOCK=/run/viofs-${VMID}-${TAG}.sock
+		${DEBUG} systemd-run --unit=viofsd-${VMID}-${TAG} /usr/libexec/virtiofsd --syslog --socket-path ${SOCK} --shared-dir ${VIOPATH} --announce-submounts --inode-file-handles=mandatory
+	done
+}
+
+
+Install()
+{
+	Prepare
+
+	MEMORY=$(qm config ${VMID}|grep ^memory|cut -d ' ' -f 2)
+	VMARGS="-object memory-backend-memfd,id=mem,size=${MEMORY}M,share=on -numa node,memdev=mem"
+	COUNT=0
+	for SHARE in "${SHARES[@]}"
+	do
+		IFS="=" read TAG VIOPATH <<< ${SHARE}
+
+		[ -d "${VIOPATH}" ] 
+		if [ $? -eq 1 ]
+		then
+# Hint if configured directory is unavailable. Will fail when trying to run VM
+			echo "Path '${VIOPATH}' not found"
+		else
+# Build VM args and virtiofsd commands
+			SOCK=/run/viofs-${VMID}-${TAG}.sock
+			VMARGS="${VMARGS} -chardev socket,id=virtiofs${COUNT},path=${SOCK}"
+			VMARGS="${VMARGS} -device vhost-user-fs-pci,chardev=virtiofs${COUNT},tag=${TAG}"
+			let COUNT++
+		fi
+	done
+
+# Add args to VM. qm set command does not work as it requires as machine is locked
+	${DEBUG} qm set ${VMID} --args "$VMARGS"
+}
+
+case ${PHASE} in
+	pre-start)
+		PreStart
+		;;
+
+	post-start)
+# Nothing to be done here
+ 		:
+		;;
+
+	pre-stop)
+# Nothing to be done here
+		:
+		;;
+
+	post-stop)
+# Nothing to be done. virtiofsd stops automatically after machine shutdown and we leave args in place
+		;;
+
+	install)
+# Not invoked by PVE. Needs to be executed while VM is not running
+ 		Install
+ 		;;
+
+	*)
+		echo "Invalid phase '${PHASE}'. This should not happen"
+		exit 1
+esac
